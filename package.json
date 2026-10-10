@@ -1,0 +1,27 @@
+{
+  "name": "@fahrizkyputra/pi-modes",
+  "version": "0.1.0",
+  "description": "Selectable agent modes for Pi. /gercep: no tests, typecheck, lint, or build — every response that changes files ends with a manual QA checklist. Default mode stays untouched.",
+  "keywords": ["pi-package", "pi-extension", "pi", "mode", "gercep", "fast", "qa", "checklist"],
+  "license": "MIT",
+  "author": "Fahrizky Putra",
+  "repository": { "type": "git", "url": "git+https://github.com/fahrizkyputra/pi-modes.git" },
+  "homepage": "https://github.com/fahrizkyputra/pi-modes#readme",
+  "bugs": { "url": "https://github.com/fahrizkyputra/pi-modes/issues" },
+  "type": "module",
+  "pi": { "extensions": ["./extensions/pi-modes.ts"] },
+  "files": ["extensions", "src", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "node scripts/e2e-rpc.mjs"
+  },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public" }
+}
