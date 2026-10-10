@@ -1,8 +1,13 @@
 # pi-modes
 
-Selectable agent modes for a Pi session. The first one is **gercep** (Indonesian slang for *gerak cepat*, "move fast"): the agent ships the change without running or writing any tests, and hands you a manual QA checklist instead.
+Selectable, independent agent modes for a Pi session:
 
-Default mode is untouched: with gercep off, this package adds no prompt rules and blocks nothing, so Pi behaves exactly as it does without it.
+| Mode | Command | In one line |
+|---|---|---|
+| **gercep** (*gerak cepat*, "move fast") | `/gercep` | No tests, typecheck, lint, or build — every response that changes files ends with a manual QA checklist |
+| **hati-hati** ("careful") | `/hati-hati` | Every risky command needs your confirmation — every response that ran one ends with a rollback section |
+
+Modes combine (`⚡ gercep · 🛡 hati-hati` = fast but safe on servers). With every mode off — the default — this package adds no prompt rules, blocks nothing, and asks nothing, so Pi behaves exactly as it does without it.
 
 ## Install
 
@@ -14,13 +19,13 @@ pi install npm:@fahrizkyputra/pi-modes
 
 | Command | What it does |
 |---|---|
-| `/gercep` or `/gercep on` | Switch this session to gercep mode |
-| `/gercep off` | Back to the default mode |
-| `/gercep status` | Show the current mode |
+| `/gercep` or `/gercep on` · `/gercep off` | Turn gercep on or off for this session |
+| `/hati-hati` or `/hati-hati on` · `/hati-hati off` | Turn hati-hati on or off for this session |
+| `/gercep status` · `/hati-hati status` | Show the active modes |
 
-The status bar shows `⚡ gercep` while the mode is active.
+The status bar shows the active modes, e.g. `⚡ gercep · 🛡 hati-hati`.
 
-## What gercep changes
+## Gercep: what it changes
 
 | Skipped | How |
 |---|---|
@@ -62,16 +67,46 @@ Ask explicitly in your message and that category opens **for that one response**
 
 A verb is required, and negations never unlock: "jangan test dulu", "test-nya nanti saja", "don't run the build", and "jalankan test tapi jangan build" (build stays blocked) all behave as you would expect. `/gercep off` always works if detection guesses wrong.
 
-### Scope
+## Hati-hati: what asks for confirmation
 
-- The mode is **per session** and persisted in it: it survives `/reload` and reopening the session with `/resume`. Other and new sessions start in default mode.
-- **Subagents** started from a gercep session inherit gercep through the `PI_MODES_ACTIVE` environment variable.
-- Forks and clones of a gercep session start in gercep too, because the mode entry is copied with the history.
+A dialog shows the full command and why it is risky — **Yes** runs it, **No** blocks it and tells the agent to find another way or ask you.
+
+| Category | Asks | Does not ask |
+|---|---|---|
+| Remote / production | ssh that restarts or stops services, `docker compose up/down`, kills processes, writes or deletes files, runs migrations, `git pull` on the server; interactive ssh; `scp`/`rsync` uploads; `rsync --delete`; `kubectl apply/delete`, `helm upgrade` | ssh that only reads: `cat`, `tail`, `journalctl`, `systemctl status`, `docker ps/logs`; `rsync -n` dry runs; downloads |
+| Release & publish | force push, push to `main`/`master`/`production`/`release*`, pushing tags, deleting remote branches, `npm publish/unpublish/deprecate`, `gh release create`, `gh pr merge`, `gh repo delete`, deploy commands (`vercel --prod`, `fly deploy`, `wrangler deploy`, `terraform apply`, `npm run deploy`, `./deploy.sh`) | `git push` to a work branch, `gh pr create`, `npm view` |
+| Database | migrations (`prisma migrate deploy`, `alembic upgrade`, `artisan migrate`, `manage.py migrate`, `rails db:migrate`, `knex migrate`), SQL that writes or drops through `psql`/`mysql`/`mongosh`/`redis-cli` (also via `docker exec`), running `.sql` files | `SELECT`, `migrate:status`, `prisma generate` |
+| Destructive local | `rm -r` outside temp, `git reset --hard`, `git clean -f`, `git branch -D`, `git tag -d`, `chmod/chown -R`, `docker rm/prune/compose down` | `rm -rf` in `/tmp`, `$TMPDIR`, `mktemp` paths, `node_modules`, `dist`, `.cache`; plain `rm` of files |
+
+Without an interactive UI (RPC/print mode, subagents), risky commands are refused instead of run silently.
+
+### Rollback section
+
+Every response that ran a confirmed risky command ends with:
+
+```
+### Rollback
+- `ssh prod 'systemctl restart clipcut-api'`
+  → git checkout v1.4.2 && systemctl restart clipcut-api
+- `git push origin main`
+  → git revert <sha> && git push origin main
+
+Cannot be rolled back: npm publish 0.3.0 (npm version numbers cannot be reused).
+```
+
+If the agent forgets it, the package asks once. When gercep is on too, a single follow-up asks for both the QA checklist and the rollback section.
+
+## Scope
+
+- Modes are **per session** and persisted in it: it survives `/reload` and reopening the session with `/resume`. Other and new sessions start in default mode.
+- **Subagents** inherit the active modes through the `PI_MODES_ACTIVE` and `PI_MODES_CAREFUL` environment variables.
+- Forks and clones start with the same modes, because the mode entry is copied with the history.
 
 ## Limits
 
 - File changes are detected from successful `write`/`edit` calls. Edits through bash (`sed -i`, `cat > file`) are not seen, so for those the checklist relies on the prompt rule alone.
 - Unknown verification scripts (`./check.sh`) are not recognized as tests; the prompt rule is what stops them.
+- Hati-hati recognizes risky commands by pattern. A wrapper script whose name does not mention deploy/release/publish/migrate (e.g. `./go.sh`) is not recognized; the prompt rule asks the agent to announce risky steps, but only recognized commands get a dialog.
 
 ## Development
 
@@ -79,7 +114,7 @@ A verb is required, and negations never unlock: "jangan test dulu", "test-nya na
 npm install
 npm test          # node:test, no Pi required
 npm run typecheck
-npm run test:e2e  # real Pi over RPC with a scripted model: block, allowed write, QA follow-up, reopen
+npm run test:e2e  # real Pi over RPC with a scripted model, for both modes
 ```
 
 ## License
