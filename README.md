@@ -23,7 +23,7 @@ pi install npm:@fahrizkyputra/pi-modes
 | `/hati-hati` or `/hati-hati on` · `/hati-hati off` | Turn hati-hati on or off for this session |
 | `/gercep status` · `/hati-hati status` | Show the active modes |
 
-The status bar shows the active modes, e.g. `⚡ gercep · 🛡 hati-hati`.
+The status bar shows the active modes, e.g. `⚡ gercep · 🛡 hati-hati`, and so does the line shown while the agent is working: `Working ⚡ gercep`, `Working ⚡ gercep · 🛡 hati-hati`. With every mode off it is Pi's own `Working` again. (Terminal UI only; RPC clients such as pi-web keep their own indicator.)
 
 ## Gercep: what it changes
 

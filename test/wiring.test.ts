@@ -16,6 +16,7 @@ function fakePi(branch: unknown[] = [], options: { confirm?: boolean; hasUI?: bo
 	const entries: { customType: string; data: unknown }[] = [];
 	const notices: string[] = [];
 	const statuses: (string | undefined)[] = [];
+	const workingMessages: (string | undefined)[] = [];
 
 	const pi = {
 		on: (name: string, handler: Handler) => {
@@ -37,6 +38,7 @@ function fakePi(branch: unknown[] = [], options: { confirm?: boolean; hasUI?: bo
 		ui: {
 			notify: (message: string) => notices.push(message),
 			setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+			setWorkingMessage: (text?: string) => workingMessages.push(text),
 			confirm: async (title: string, message: string) => {
 				confirms.push({ title, message });
 				return options.confirm ?? true;
@@ -54,7 +56,7 @@ function fakePi(branch: unknown[] = [], options: { confirm?: boolean; hasUI?: bo
 		return result;
 	};
 
-	return { pi, ctx, hooks, commands, entries, notices, statuses, emit, branch, confirms };
+	return { pi, ctx, hooks, commands, entries, notices, statuses, emit, branch, confirms, workingMessages };
 }
 
 function promptEvent(prompt: string) {
@@ -331,4 +333,40 @@ test("/gercep status and unknown arguments", async () => {
 	assert.match(notices.at(-1) ?? "", /Mode: default/);
 	await commands.gercep!.handler("wat", ctx);
 	assert.match(notices.at(-1) ?? "", /Unknown argument/);
+});
+
+test("the Working line names the active modes and resets when they are off", async () => {
+	const { pi, ctx, emit, commands, workingMessages } = fakePi();
+	piModesExtension(pi);
+	await emit("session_start", { reason: "startup" });
+	assert.equal(workingMessages.at(-1), undefined, "default mode keeps Pi's own Working");
+
+	await commands.gercep!.handler("on", ctx);
+	assert.equal(workingMessages.at(-1), "Working ⚡ gercep");
+
+	await commands["hati-hati"]!.handler("on", ctx);
+	assert.equal(workingMessages.at(-1), "Working ⚡ gercep · 🛡 hati-hati");
+
+	await commands.gercep!.handler("off", ctx);
+	assert.equal(workingMessages.at(-1), "Working 🛡 hati-hati");
+
+	await commands["hati-hati"]!.handler("off", ctx);
+	assert.equal(workingMessages.at(-1), undefined);
+});
+
+test("the Working line is restored after a reload", async () => {
+	const branch: unknown[] = [{ type: "custom", customType: "pi-modes-state", data: { mode: "gercep", careful: false } }];
+	const { pi, emit, workingMessages } = fakePi(branch);
+	piModesExtension(pi);
+	await emit("session_start", { reason: "reload" });
+	assert.equal(workingMessages.at(-1), "Working ⚡ gercep");
+});
+
+test("an older Pi without setWorkingMessage still works", async () => {
+	const { pi, ctx, emit, commands, statuses } = fakePi();
+	delete (ctx.ui as { setWorkingMessage?: unknown }).setWorkingMessage;
+	piModesExtension(pi);
+	await emit("session_start", { reason: "startup" });
+	await commands.gercep!.handler("on", ctx);
+	assert.equal(statuses.at(-1), "⚡ gercep");
 });

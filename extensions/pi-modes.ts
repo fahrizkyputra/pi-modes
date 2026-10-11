@@ -54,6 +54,11 @@ function restoredState(ctx: ExtensionContext): ModeState {
 	return state;
 }
 
+/** `Working ⚡ gercep`, `Working ⚡ gercep · 🛡 hati-hati`, or undefined for Pi's own "Working". */
+export function workingMessage(activeModes: readonly string[]): string | undefined {
+	return activeModes.length > 0 ? `Working ${activeModes.join(" · ")}` : undefined;
+}
+
 function gitBranch(cwd: string | undefined, fallbackCwd: string): string | undefined {
 	try {
 		const output = execFileSync("git", ["-C", cwd ?? fallbackCwd, "rev-parse", "--abbrev-ref", "HEAD"], {
@@ -85,6 +90,10 @@ export default function piModesExtension(pi: ExtensionAPI) {
 			(part): part is string => part !== undefined,
 		);
 		ctx.ui.setStatus(STATUS_KEY, parts.length > 0 ? parts.join(" · ") : undefined);
+		// The "Working" line shown while the agent runs; undefined restores Pi's default.
+		if (typeof ctx.ui.setWorkingMessage === "function") {
+			ctx.ui.setWorkingMessage(workingMessage(parts));
+		}
 		if (gercep.isActive()) process.env[ENV_FLAG] = MODE_ID;
 		else delete process.env[ENV_FLAG];
 		if (careful.isActive()) process.env[CAREFUL_ENV_FLAG] = CAREFUL_MODE_ID;
