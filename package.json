@@ -1,6 +1,6 @@
 {
   "name": "@fahrizkyputra/pi-modes",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Selectable, independent agent modes for Pi. /gercep: no tests/typecheck/lint/build, ends with a manual QA checklist. /hati-hati: confirm every risky command, ends with a rollback section. Default stays untouched.",
   "keywords": [
     "pi-package",
