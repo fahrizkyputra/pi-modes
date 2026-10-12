@@ -1,7 +1,7 @@
 {
   "name": "@fahrizkyputra/pi-modes",
-  "version": "0.3.0",
-  "description": "Selectable, independent agent modes for Pi. /gercep: no tests/typecheck/lint/build, ends with a manual QA checklist. /hati-hati: confirm every risky command, ends with a rollback section. Default stays untouched.",
+  "version": "0.4.0",
+  "description": "Selectable, independent agent modes for Pi. /gercep: no tests/typecheck/lint/build, ends with a manual QA checklist. /hati-hati: confirm every risky command, ends with a rollback section. /auto-effort: a small judge model sets thinking to medium/high/xhigh per prompt. Default stays untouched.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -14,7 +14,11 @@
     "safety",
     "confirm",
     "rollback",
-    "production"
+    "production",
+    "effort",
+    "thinking",
+    "reasoning",
+    "auto-effort"
   ],
   "license": "MIT",
   "author": "Fahrizky Putra",
@@ -41,7 +45,7 @@
   "scripts": {
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "test:e2e": "node scripts/e2e-gercep.mjs && node scripts/e2e-careful.mjs"
+    "test:e2e": "node scripts/e2e-gercep.mjs && node scripts/e2e-careful.mjs && node scripts/e2e-effort.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
