@@ -6,6 +6,7 @@ Selectable, independent agent modes for a Pi session:
 |---|---|---|
 | **gercep** (*gerak cepat*, "move fast") | `/gercep` | No tests, typecheck, lint, or build — every response that changes files ends with a manual QA checklist |
 | **hati-hati** ("careful") | `/hati-hati` | Every risky command needs your confirmation — every response that ran one ends with a rollback section |
+| **auto-effort** | `/auto-effort` | Before each prompt you send, a small judge model sets thinking to `medium`, `high`, or `xhigh` |
 
 Modes combine (`⚡ gercep · 🛡 hati-hati` = fast but safe on servers). With every mode off — the default — this package adds no prompt rules, blocks nothing, and asks nothing, so Pi behaves exactly as it does without it.
 
@@ -21,7 +22,9 @@ pi install npm:@fahrizkyputra/pi-modes
 |---|---|
 | `/gercep` or `/gercep on` · `/gercep off` | Turn gercep on or off for this session |
 | `/hati-hati` or `/hati-hati on` · `/hati-hati off` | Turn hati-hati on or off for this session |
-| `/gercep status` · `/hati-hati status` | Show the active modes |
+| `/auto-effort` or `/auto-effort on` · `/auto-effort off` | Turn auto-effort on or off for this session |
+| `/auto-effort model <provider/id>` | Set the judge model for every session (default `9router/cc/claude-haiku-5-5`) |
+| `/gercep status` · `/hati-hati status` · `/auto-effort status` | Show the active modes |
 
 The status bar shows the active modes, e.g. `⚡ gercep · 🛡 hati-hati`, and so does the line shown while the agent is working: `Working ⚡ gercep`, `Working ⚡ gercep · 🛡 hati-hati`. With every mode off it is Pi's own `Working` again.
 
@@ -100,10 +103,33 @@ Cannot be rolled back: npm publish 0.3.0 (npm version numbers cannot be reused).
 
 If the agent forgets it, the package asks once. When gercep is on too, a single follow-up asks for both the QA checklist and the rollback section.
 
+## Auto-effort: what it changes
+
+Before each prompt you type, the judge model gets your prompt plus the last ~500 characters of the previous answer (so "lanjut" is rated by the work it continues) and picks a level:
+
+| Level | For |
+|---|---|
+| `medium` | A quick question, a small edit, a rename, one clear file |
+| `high` | A bug fix, a medium feature, analysis, a code review, an ordinary multi-step task |
+| `xhigh` | A multi-file refactor or migration, hard debugging, a long investigation, heavy web or codebase research, anything likely over 30 minutes |
+
+The rubric follows [Anthropic's effort guidance](https://platform.claude.com/docs/en/build-with-claude/effort). The status bar shows `🧠 auto→xhigh` and the Working line `Working 🧠 xhigh`; `/auto-effort status` adds the judge's reason.
+
+| Situation | Behavior |
+|---|---|
+| Judge fails, times out (3 s), or answers nonsense | `high`, with a one-line warning |
+| You change the level yourself (Shift+Tab, `/thinking`) | Auto-effort pauses and keeps your level; `/auto-effort on` resumes it |
+| You switch models | Not a manual change: Pi clamps the level to the new model, auto-effort keeps going |
+| `/auto-effort off` | Puts back the level you had before turning it on |
+| Messages from extensions, steering and follow-ups queued while the agent runs | Not judged: the level stays as it is |
+| Model without `xhigh` | Pi clamps to the closest level the model supports |
+
+Each judged prompt costs one small judge call (about one second with Haiku 5.5, about 1–2k input tokens). The judge model is saved in `~/.pi/agent/pi-modes.json`; on/off is per session.
+
 ## Scope
 
 - Modes are **per session** and persisted in it: it survives `/reload` and reopening the session with `/resume`. Other and new sessions start in default mode.
-- **Subagents** inherit the active modes through the `PI_MODES_ACTIVE` and `PI_MODES_CAREFUL` environment variables.
+- **Subagents** inherit gercep and hati-hati through the `PI_MODES_ACTIVE` and `PI_MODES_CAREFUL` environment variables. Auto-effort never runs in subagents (`PI_SUBAGENT_CHILD=1`); they keep the level from their own agent config.
 - Forks and clones start with the same modes, because the mode entry is copied with the history.
 
 ## Limits
@@ -118,7 +144,7 @@ If the agent forgets it, the package asks once. When gercep is on too, a single 
 npm install
 npm test          # node:test, no Pi required
 npm run typecheck
-npm run test:e2e  # real Pi over RPC with a scripted model, for both modes
+npm run test:e2e  # real Pi over RPC with a scripted model, for every mode
 ```
 
 ## License
