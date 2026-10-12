@@ -32,13 +32,21 @@ function fakePi(branch: unknown[] = [], options: { confirm?: boolean; hasUI?: bo
 	} as unknown as ExtensionAPI;
 
 	const confirms: { title: string; message: string }[] = [];
+	let editorFactory: unknown;
+	const editorChanges: unknown[] = [];
 	const ctx = {
+		mode: "tui",
 		hasUI: options.hasUI ?? true,
 		cwd: process.cwd(),
 		ui: {
 			notify: (message: string) => notices.push(message),
 			setStatus: (_key: string, text: string | undefined) => statuses.push(text),
 			setWorkingMessage: (text?: string) => workingMessages.push(text),
+			setEditorComponent: (factory: unknown) => {
+				editorFactory = factory;
+				editorChanges.push(factory);
+			},
+			getEditorComponent: () => editorFactory,
 			confirm: async (title: string, message: string) => {
 				confirms.push({ title, message });
 				return options.confirm ?? true;
@@ -56,7 +64,13 @@ function fakePi(branch: unknown[] = [], options: { confirm?: boolean; hasUI?: bo
 		return result;
 	};
 
-	return { pi, ctx, hooks, commands, entries, notices, statuses, emit, branch, confirms, workingMessages };
+	return {
+		pi, ctx, hooks, commands, entries, notices, statuses, emit, branch, confirms, workingMessages, editorChanges,
+		currentEditor: () => editorFactory,
+		setForeignEditor: (factory: unknown) => {
+			editorFactory = factory;
+		},
+	};
 }
 
 function promptEvent(prompt: string) {
@@ -369,4 +383,50 @@ test("an older Pi without setWorkingMessage still works", async () => {
 	await emit("session_start", { reason: "startup" });
 	await commands.gercep!.handler("on", ctx);
 	assert.equal(statuses.at(-1), "⚡ gercep");
+});
+
+test("gercep installs the flashing editor and removes it when turned off", async () => {
+	const { pi, ctx, emit, commands, currentEditor, editorChanges } = fakePi();
+	piModesExtension(pi);
+	await emit("session_start", { reason: "startup" });
+	assert.equal(currentEditor(), undefined, "default mode leaves Pi's editor alone");
+
+	await commands.gercep!.handler("on", ctx);
+	assert.equal(typeof currentEditor(), "function", "flashing editor installed");
+
+	await commands["hati-hati"]!.handler("on", ctx);
+	assert.equal(editorChanges.length, 1, "turning on another mode does not reinstall it");
+
+	await commands.gercep!.handler("off", ctx);
+	assert.equal(currentEditor(), undefined, "Pi's editor restored");
+});
+
+test("another extension's custom editor is never replaced or removed", async () => {
+	const { pi, ctx, emit, commands, currentEditor, setForeignEditor } = fakePi();
+	const foreign = () => ({});
+	piModesExtension(pi);
+	await emit("session_start", { reason: "startup" });
+	setForeignEditor(foreign);
+
+	await commands.gercep!.handler("on", ctx);
+	assert.equal(currentEditor(), foreign, "left in place while gercep is on");
+	await commands.gercep!.handler("off", ctx);
+	assert.equal(currentEditor(), foreign, "and not removed when gercep turns off");
+});
+
+test("the flashing editor is TUI-only", async () => {
+	const { pi, ctx, emit, commands, currentEditor } = fakePi();
+	(ctx as { mode: string }).mode = "rpc";
+	piModesExtension(pi);
+	await emit("session_start", { reason: "startup" });
+	await commands.gercep!.handler("on", ctx);
+	assert.equal(currentEditor(), undefined);
+});
+
+test("a reloaded gercep session gets the flashing editor back", async () => {
+	const branch: unknown[] = [{ type: "custom", customType: "pi-modes-state", data: { mode: "gercep", careful: false } }];
+	const { pi, emit, currentEditor } = fakePi(branch);
+	piModesExtension(pi);
+	await emit("session_start", { reason: "reload" });
+	assert.equal(typeof currentEditor(), "function");
 });

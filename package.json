@@ -1,6 +1,6 @@
 {
   "name": "@fahrizkyputra/pi-modes",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Selectable, independent agent modes for Pi. /gercep: no tests/typecheck/lint/build, ends with a manual QA checklist. /hati-hati: confirm every risky command, ends with a rollback section. Default stays untouched.",
   "keywords": [
     "pi-package",
@@ -44,12 +44,14 @@
     "test:e2e": "node scripts/e2e-gercep.mjs && node scripts/e2e-careful.mjs"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@types/node": "^22.0.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "@earendil-works/pi-tui": "*"
   },
   "engines": {
     "node": ">=20"
