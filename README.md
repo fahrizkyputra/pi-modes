@@ -23,7 +23,11 @@ pi install npm:@fahrizkyputra/pi-modes
 | `/hati-hati` or `/hati-hati on` · `/hati-hati off` | Turn hati-hati on or off for this session |
 | `/gercep status` · `/hati-hati status` | Show the active modes |
 
-The status bar shows the active modes, e.g. `⚡ gercep · 🛡 hati-hati`, and so does the line shown while the agent is working: `Working ⚡ gercep`, `Working ⚡ gercep · 🛡 hati-hati`. With every mode off it is Pi's own `Working` again. (Terminal UI only; RPC clients such as pi-web keep their own indicator.)
+The status bar shows the active modes, e.g. `⚡ gercep · 🛡 hati-hati`, and so does the line shown while the agent is working: `Working ⚡ gercep`, `Working ⚡ gercep · 🛡 hati-hati`. With every mode off it is Pi's own `Working` again.
+
+While gercep is on and the agent is working, that whole top border flashes **bright yellow ↔ bright orange four times a second**, so a fast-and-loose session is impossible to miss. It returns to the theme color as soon as the agent stops or gercep turns off. The flash uses a subclass of Pi's own editor; if another extension already installed a custom editor, pi-modes leaves it alone and skips the flash.
+
+(Terminal UI only; RPC clients such as pi-web keep their own indicator.)
 
 ## Gercep: what it changes
 

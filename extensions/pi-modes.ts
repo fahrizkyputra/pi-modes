@@ -23,6 +23,7 @@ import {
 } from "../src/careful.ts";
 import { type ModeId, ModeController } from "../src/controller.ts";
 import { ENV_FLAG, MODE_ID, QA_HEADING, STATUS_TEXT, categoryLabel } from "../src/gercep.ts";
+import { GercepEditor } from "../src/gercep-editor.ts";
 
 const STATE_ENTRY = "pi-modes-state";
 const FOLLOW_UP_TYPE = "pi-modes-follow-up";
@@ -85,6 +86,33 @@ export default function piModesExtension(pi: ExtensionAPI) {
 		pi.appendEntry<ModeState>(STATE_ENTRY, { mode: gercep.getMode(), careful: careful.isActive() });
 	};
 
+	/** The editor factory pi-modes installed, so it is only ever removed by pi-modes. */
+	let flashFactory: ((...args: Parameters<NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>>) => GercepEditor) | undefined;
+	let flashEditor: GercepEditor | undefined;
+
+	/** Gercep on: flashing border editor. Off: Pi's editor back. Never replaces another extension's editor. */
+	const applyFlashEditor = (ctx: ExtensionContext) => {
+		if (ctx.mode !== "tui") return;
+		const ui = ctx.ui as Partial<ExtensionContext["ui"]>;
+		if (typeof ui.setEditorComponent !== "function" || typeof ui.getEditorComponent !== "function") return;
+		const current = ui.getEditorComponent();
+		if (gercep.isActive()) {
+			if (current !== undefined && current !== flashFactory) return; // someone else owns the editor
+			if (current === flashFactory && flashFactory !== undefined) return;
+			flashFactory = (tui, theme, keybindings) => {
+				flashEditor?.dispose();
+				flashEditor = new GercepEditor(tui, theme, keybindings);
+				return flashEditor;
+			};
+			ui.setEditorComponent(flashFactory);
+			return;
+		}
+		if (flashFactory !== undefined && current === flashFactory) ui.setEditorComponent(undefined);
+		flashEditor?.dispose();
+		flashEditor = undefined;
+		flashFactory = undefined;
+	};
+
 	const applyIndicators = (ctx: ExtensionContext) => {
 		const parts = [gercep.isActive() ? STATUS_TEXT : undefined, careful.isActive() ? CAREFUL_STATUS_TEXT : undefined].filter(
 			(part): part is string => part !== undefined,
@@ -98,6 +126,7 @@ export default function piModesExtension(pi: ExtensionAPI) {
 		else delete process.env[ENV_FLAG];
 		if (careful.isActive()) process.env[CAREFUL_ENV_FLAG] = CAREFUL_MODE_ID;
 		else delete process.env[CAREFUL_ENV_FLAG];
+		applyFlashEditor(ctx);
 	};
 
 	pi.on("session_start", (_event, ctx) => {
@@ -186,6 +215,8 @@ export default function piModesExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		flashEditor?.dispose();
+		flashEditor = undefined;
 		delete process.env[ENV_FLAG];
 		delete process.env[CAREFUL_ENV_FLAG];
 	});
