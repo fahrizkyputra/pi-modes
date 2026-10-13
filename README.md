@@ -7,6 +7,7 @@ Selectable, independent agent modes for a Pi session:
 | **gercep** (*gerak cepat*, "move fast") | `/gercep` | No tests, typecheck, lint, or build — every response that changes files ends with a manual QA checklist |
 | **hati-hati** ("careful") | `/hati-hati` | Every risky command needs your confirmation — every response that ran one ends with a rollback section |
 | **auto-effort** | `/auto-effort` | Before each prompt you send, a small judge model sets thinking to `medium`, `high`, or `xhigh` |
+| **auto-review** | `/auto-review` · `/review` | An independent reviewer model (Opus 5.5 by default) checks each task's diff; critical/major findings go back to the agent, then one re-review |
 
 Modes combine (`⚡ gercep · 🛡 hati-hati` = fast but safe on servers). With every mode off — the default — this package adds no prompt rules, blocks nothing, and asks nothing, so Pi behaves exactly as it does without it.
 
@@ -24,7 +25,11 @@ pi install npm:@fahrizkyputra/pi-modes
 | `/hati-hati` or `/hati-hati on` · `/hati-hati off` | Turn hati-hati on or off for this session |
 | `/auto-effort` or `/auto-effort on` · `/auto-effort off` | Turn auto-effort on or off for this session |
 | `/auto-effort model <provider/id>` | Set the judge model for every session (default `9router/cc/claude-haiku-5-5`) |
-| `/gercep status` · `/hati-hati status` · `/auto-effort status` | Show the active modes |
+| `/auto-review` or `/auto-review on` · `/auto-review off` | Turn automatic review on or off for this session |
+| `/auto-review model <provider/id>` | Set the reviewer model for every session (default `9router/cc/claude-opus-5-5`) |
+| `/review` | Review the last task that changed files, now — also when auto-review is off |
+| `/review session` · `/review uncommitted` | Review every change of this session, or everything not committed yet (including your own edits) |
+| `/gercep status` · `/hati-hati status` · `/auto-effort status` · `/auto-review status` | Show the active modes |
 
 The status bar shows the active modes, e.g. `⚡ gercep · 🛡 hati-hati`, and so does the line shown while the agent is working: `Working ⚡ gercep`, `Working ⚡ gercep · 🛡 hati-hati`. With every mode off it is Pi's own `Working` again.
 
@@ -126,16 +131,61 @@ The rubric follows [Anthropic's effort guidance](https://platform.claude.com/doc
 
 Each judged prompt costs one small judge call (about one second with Haiku 5.5, about 1–2k input tokens). The judge model is saved in `~/.pi/agent/pi-modes.json`; on/off is per session.
 
+## Auto-review and /review: what happens
+
+When a task ends (the agent settles after a prompt you sent), pi-modes looks at what changed in the git working tree since that prompt:
+
+1. **Reviewer.** A separate agent with a **fresh context** — it never sees your conversation — gets your request, the diff, and the agent's own summary. It has **read-only tools** (`read`, `grep`, `find`, `ls`) to check callers and surrounding code, and no `edit`, `write`, or `bash`.
+2. **Effort.** `high`; `xhigh` when the diff touches a risky path, more than 10 files, or more than 400 lines. Never `max`.
+3. **Report.** One block in the chat, e.g.
+   ```
+   🔍 Review (opus-5-5 · xhigh) — 1 major, 1 minor
+   [major] middleware/rate-limit.ts:18 — counter in memory
+   [minor] auth/login.ts:42 — no Retry-After header
+   → critical/major sent to the agent to fix; the fix gets one re-review
+   ```
+   Ctrl+O expands it with the reviewer's reasoning, suggested fixes, what it checked and found fine, time, and cost.
+4. **Fix.** Critical and major findings go back to the agent as a hidden message. Minor ones are only reported. The agent may push back on a finding it is sure is wrong.
+5. **Re-review.** Only the fix diff is reviewed, once. Whatever it finds is reported, not sent again, so a review never loops.
+
+| When | Automatic review (`/auto-review on`) | `/review` |
+|---|---|---|
+| Diff of more than 20 lines | ✓ | ✓ |
+| Smaller diff on a risky path | ✓ | ✓ |
+| Small, safe diff (typo, one config line) | skipped | ✓ |
+| Question or read-only task | skipped | "No task with file changes" |
+
+**Risky paths** contain `auth`, `login`, `session`, `token`, `secret`, `password`, `crypto`, `payment`, `billing`, `migration`, `permission`, `.env`, or `.sql`. Add your own in `~/.pi/agent/pi-modes.json`:
+
+```json
+{ "autoReview": { "model": "9router/cc/claude-opus-5-5", "riskyPaths": ["kyc", "ledger"] } }
+```
+
+| Situation | Behavior |
+|---|---|
+| Reviewer fails (rate limit, missing model, timeout after 15 min) | One warning; the agent is never blocked |
+| Esc while reviewing | Cancels the review |
+| The agent changed nothing for the findings | No re-review |
+| A rate-limited run resumed by an extension (e.g. pi-auto-resume) | Same task: the review covers everything since your prompt |
+| With gercep | Review runs normally; the QA checklist follow-up comes after the fix and re-review |
+| Not a git repository | Nothing is reviewed; `/review` says so |
+
+**How changes are found.** At each prompt, pi-modes snapshots the working tree as a git tree object using a temporary index file (`git add -A` + `git write-tree` against a copy of the index). Your working tree, index, staged files, stash, branches, and commits are never touched, and ignored files stay out. The snapshot objects are unreachable, so `git gc` removes them eventually. This runs in every git session, also with auto-review off, so `/review` works when you forgot to turn it on; it takes a few milliseconds.
+
+**Cost.** One review is one reviewer agent run: roughly 20k input / 5k output tokens for a small change, more for big ones. With Opus 5.5 that is about $0.20–1.30 per review, plus the re-review when findings were sent to fix.
+
 ## Scope
 
 - Modes are **per session** and persisted in it: it survives `/reload` and reopening the session with `/resume`. Other and new sessions start in default mode.
-- **Subagents** inherit gercep and hati-hati through the `PI_MODES_ACTIVE` and `PI_MODES_CAREFUL` environment variables. Auto-effort never runs in subagents (`PI_SUBAGENT_CHILD=1`); they keep the level from their own agent config.
+- **Subagents** inherit gercep and hati-hati through the `PI_MODES_ACTIVE` and `PI_MODES_CAREFUL` environment variables. Auto-effort and auto-review never run in subagents (`PI_SUBAGENT_CHILD=1`); subagents keep the level from their own agent config.
 - Forks and clones start with the same modes, because the mode entry is copied with the history.
 
 ## Limits
 
 - File changes are detected from successful `write`/`edit` calls. Edits through bash (`sed -i`, `cat > file`) are not seen, so for those the checklist relies on the prompt rule alone.
 - Unknown verification scripts (`./check.sh`) are not recognized as tests; the prompt rule is what stops them.
+- Auto-review reviews what changed in the working tree since your prompt. If you edit files yourself while the agent works, those edits are in the diff too.
+- The review progress line and Esc-to-cancel are terminal-UI features; in RPC clients the review still runs and reports, with a status text instead.
 - Hati-hati recognizes risky commands by pattern. A wrapper script whose name does not mention deploy/release/publish/migrate (e.g. `./go.sh`) is not recognized; the prompt rule asks the agent to announce risky steps, but only recognized commands get a dialog.
 
 ## Development

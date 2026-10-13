@@ -7,10 +7,12 @@
  * - gercep:    skip all automated verification, end with a manual QA checklist
  * - hati-hati: confirm every risky command, end with a rollback section
  * - auto-effort: a small judge model picks medium/high/xhigh thinking per prompt
+ * - auto-review: an independent reviewer model checks each task's diff; /review on demand
  */
 
 import { execFileSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Loader, Text, matchesKey } from "@earendil-works/pi-tui";
 import {
 	CAREFUL_ENV_FLAG,
 	CAREFUL_MODE_ID,
@@ -38,10 +40,34 @@ import {
 } from "../src/effort.ts";
 import { ENV_FLAG, MODE_ID, QA_HEADING, STATUS_TEXT, categoryLabel } from "../src/gercep.ts";
 import { GercepEditor } from "../src/gercep-editor.ts";
+import { diffNumstat, diffPatch, headTree, repoRoot, snapshotTree } from "../src/git-snapshot.ts";
+import {
+	DEFAULT_REVIEW_MODEL,
+	REVIEW_MODE_ID,
+	REVIEW_TIMEOUT_MS,
+	type ReportDetails,
+	type ReviewEffort,
+	type ReviewScope,
+	parseNumstat,
+	reportExpanded,
+	reportText,
+	reviewConfig,
+	reviewModelRef,
+	riskyPatterns,
+	shortModel,
+	writeReviewModel,
+} from "../src/review.ts";
+import { type ReviewHost, type ReviewOutcome, type ReviewerRun, ReviewController, type TaskRecord } from "../src/review-controller.ts";
+import { runReviewer } from "../src/reviewer.ts";
 
 const STATE_ENTRY = "pi-modes-state";
 const FOLLOW_UP_TYPE = "pi-modes-follow-up";
 const STATUS_KEY = "pi-modes";
+const REVIEW_TASK_ENTRY = "pi-modes-review-task";
+const REVIEW_REPORT_TYPE = "pi-modes-review";
+const REVIEW_FIX_TYPE = "pi-modes-review-fix";
+const REVIEW_WIDGET = "pi-modes-review";
+const REVIEW_STATUS_TEXT = "🔍 auto-review";
 
 /** Persisted per session. Older versions wrote fewer fields, so every field is optional. */
 interface ModeState {
@@ -50,6 +76,7 @@ interface ModeState {
 	autoEffort?: boolean;
 	/** Thinking level to put back when auto-effort turns off. */
 	effortRestore?: ThinkingLevel;
+	autoReview?: boolean;
 }
 
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -78,9 +105,29 @@ function restoredState(ctx: ExtensionContext): ModeState {
 			state.autoEffort = data.autoEffort;
 			state.effortRestore = isThinkingLevel(data.effortRestore) ? data.effortRestore : undefined;
 		}
+		if (typeof data?.autoReview === "boolean") state.autoReview = data.autoReview;
 	}
 	return state;
 }
+
+/** The latest task with a change on the active branch, so /review works after /reload or /resume. */
+function restoredReviewTask(ctx: ExtensionContext): TaskRecord | undefined {
+	let record: TaskRecord | undefined;
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type !== "custom" || entry.customType !== REVIEW_TASK_ENTRY) continue;
+		const data = entry.data as Partial<TaskRecord> | undefined;
+		if (typeof data?.base === "string") {
+			record = {
+				request: typeof data.request === "string" ? data.request : "",
+				base: data.base,
+				...(typeof data.sessionBase === "string" ? { sessionBase: data.sessionBase } : {}),
+			};
+		}
+	}
+	return record;
+}
+
+const REVIEW_SCOPES: readonly ReviewScope[] = ["task", "session", "uncommitted"];
 
 /** Text of the latest assistant message on the branch, for prompts after /resume. */
 function lastAssistantOnBranch(ctx: ExtensionContext): string | undefined {
@@ -135,6 +182,137 @@ export default function piModesExtension(pi: ExtensionAPI) {
 	const isSubagent = process.env.PI_SUBAGENT_CHILD === "1";
 	let effortUsed = false;
 
+	// ---- auto-review ----
+	let autoReview = false;
+	let reviewUsed = false;
+	/** Repository root of the session, or undefined outside git. */
+	let repo: string | undefined;
+	/** Set by the input event: the next prompt came from an extension (e.g. an auto-resume), not the user. */
+	let nextPromptFromExtension = false;
+	/** The context the running review belongs to; set just before a review starts. */
+	let reviewCtx: ExtensionContext | undefined;
+	let reviewManual = false;
+	let reviewRunning = false;
+	let reviewLabel = "";
+	let reviewToolCalls = 0;
+	let reviewLoader: Loader | undefined;
+
+	const reviewHost: ReviewHost = {
+		snapshot: () => (repo && !isSubagent ? snapshotTree(repo) : undefined),
+		headTree: () => (repo ? headTree(repo) : undefined),
+		diff: (from, to) => {
+			if (!repo) return undefined;
+			try {
+				const patterns = riskyPatterns(reviewConfig());
+				return { stats: parseNumstat(diffNumstat(repo, from, to), patterns), patch: diffPatch(repo, from, to) };
+			} catch {
+				return undefined;
+			}
+		},
+		modelRef: () => reviewModelRef(reviewConfig()),
+		runReviewer: (userText, effort) => runReviewerFor(userText, effort),
+	};
+	const review = new ReviewController(reviewHost);
+
+	const reviewWidgetText = () =>
+		`🔍 Reviewing with ${reviewLabel}${reviewToolCalls > 0 ? ` · ${reviewToolCalls} tool call${reviewToolCalls === 1 ? "" : "s"}` : ""} · Esc to cancel`;
+
+	const showReviewWidget = (ctx: ExtensionContext) => {
+		if (ctx.mode === "tui" && typeof ctx.ui.setWidget === "function") {
+			ctx.ui.setWidget(REVIEW_WIDGET, (tui, theme) => {
+				reviewLoader?.stop();
+				const loader = new Loader(tui, (text) => theme.fg("accent", text), (text) => theme.fg("muted", text), reviewWidgetText());
+				reviewLoader = loader;
+				return Object.assign(loader, {
+					dispose: () => {
+						loader.stop();
+						if (reviewLoader === loader) reviewLoader = undefined;
+					},
+				});
+			});
+		}
+		ctx.ui.setStatus(`${STATUS_KEY}-review`, reviewWidgetText());
+	};
+
+	const hideReviewWidget = (ctx: ExtensionContext) => {
+		reviewLoader?.stop();
+		reviewLoader = undefined;
+		if (ctx.mode === "tui" && typeof ctx.ui.setWidget === "function") ctx.ui.setWidget(REVIEW_WIDGET, undefined);
+		ctx.ui.setStatus(`${STATUS_KEY}-review`, undefined);
+	};
+
+	/** Run the reviewer agent for the current reviewCtx. Never rejects. */
+	async function runReviewerFor(userText: string, effort: ReviewEffort): Promise<ReviewerRun> {
+		const ctx = reviewCtx;
+		const ref = reviewModelRef(reviewConfig());
+		const failed = (error: string): ReviewerRun => ({ text: "", ok: false, error, costUsd: 0, durationMs: 0 });
+		if (!ctx || !repo) return failed("no session context");
+		const parts = splitModelRef(ref);
+		const model = parts ? ctx.modelRegistry.find(parts.provider, parts.id) : undefined;
+		if (!model) return failed(`model ${ref} not found — set one with /auto-review model <provider/id>`);
+
+		const abort = new AbortController();
+		reviewLabel = `${shortModel(ref)} · ${effort}`;
+		reviewToolCalls = 0;
+		showReviewWidget(ctx);
+		const manual = reviewManual;
+		const stopListening =
+			typeof ctx.ui.onTerminalInput === "function"
+				? ctx.ui.onTerminalInput((data) => {
+						if (!matchesKey(data, "escape")) return undefined;
+						abort.abort();
+						// During /review the agent is idle, so Esc would otherwise reach the editor.
+						return manual ? { consume: true } : undefined;
+					})
+				: () => {};
+		try {
+			const result = await runReviewer({
+				model,
+				effort,
+				cwd: repo,
+				userText,
+				access: ctx.modelRegistry as never,
+				signal: abort.signal,
+				timeoutMs: REVIEW_TIMEOUT_MS,
+				onProgress: (count) => {
+					reviewToolCalls = count;
+					reviewLoader?.setMessage(reviewWidgetText());
+					ctx.ui.setStatus(`${STATUS_KEY}-review`, reviewWidgetText());
+				},
+			});
+			return result;
+		} finally {
+			stopListening();
+			hideReviewWidget(ctx);
+		}
+	}
+
+	const reportMessage = (details: ReportDetails) => ({
+		customType: REVIEW_REPORT_TYPE,
+		content: reportText(details),
+		display: true,
+		details,
+	});
+
+	pi.registerMessageRenderer?.<ReportDetails>(REVIEW_REPORT_TYPE, (message, { expanded, outputPad }, theme) => {
+		const details = message.details;
+		const raw = typeof message.content === "string" ? message.content : textOf(message.content);
+		const [header = "", ...rest] = raw.split("\n");
+		const color = (line: string) => {
+			if (line.startsWith("[critical]")) return theme.fg("error", line);
+			if (line.startsWith("[major]")) return theme.fg("warning", line);
+			if (line.startsWith("[minor]")) return theme.fg("muted", line);
+			if (line.startsWith("→")) return theme.fg("dim", line);
+			return line;
+		};
+		let text = [theme.fg("accent", theme.bold(header)), ...rest.map(color)].join("\n");
+		if (expanded && details) text += `\n\n${theme.fg("dim", reportExpanded(details))}`;
+		else if (details) text += `\n${theme.fg("dim", "(Ctrl+O for details)")}`;
+		const box = new Box(outputPad, 1, (line) => theme.bg("customMessageBg", line));
+		box.addChild(new Text(text, 0, 0));
+		return box;
+	});
+
 	const persist = () => {
 		const state: ModeState = { mode: gercep.getMode(), careful: careful.isActive() };
 		// Only sessions that ever used auto-effort carry its fields.
@@ -143,6 +321,7 @@ export default function piModesExtension(pi: ExtensionAPI) {
 			const restoreLevel = effort.getRestoreLevel();
 			if (restoreLevel !== undefined) state.effortRestore = restoreLevel;
 		}
+		if (reviewUsed) state.autoReview = autoReview;
 		pi.appendEntry<ModeState>(STATE_ENTRY, state);
 	};
 
@@ -198,7 +377,9 @@ export default function piModesExtension(pi: ExtensionAPI) {
 
 	const applyIndicators = (ctx: ExtensionContext) => {
 		const modes = [gercep.isActive() ? STATUS_TEXT : undefined, careful.isActive() ? CAREFUL_STATUS_TEXT : undefined];
-		const parts = [...modes, effort.statusText()].filter((part): part is string => part !== undefined);
+		const parts = [...modes, effort.statusText(), autoReview ? REVIEW_STATUS_TEXT : undefined].filter(
+			(part): part is string => part !== undefined,
+		);
 		ctx.ui.setStatus(STATUS_KEY, parts.length > 0 ? parts.join(" · ") : undefined);
 		// The "Working" line shown while the agent runs; undefined restores Pi's default.
 		if (typeof ctx.ui.setWorkingMessage === "function") {
@@ -222,6 +403,11 @@ export default function piModesExtension(pi: ExtensionAPI) {
 		careful.setActive(restored.careful ?? inheritedCareful);
 		effort.restore(!isSubagent && restored.autoEffort === true, restored.effortRestore);
 		effortUsed = restored.autoEffort !== undefined;
+		autoReview = !isSubagent && restored.autoReview === true;
+		reviewUsed = restored.autoReview !== undefined;
+		repo = isSubagent ? undefined : repoRoot(sessionCwd);
+		review.restore(restoredReviewTask(ctx));
+		nextPromptFromExtension = false;
 		knownModel = modelKey(ctx.model);
 		judgeNextPrompt = false;
 		applyIndicators(ctx);
@@ -231,6 +417,7 @@ export default function piModesExtension(pi: ExtensionAPI) {
 		// Only prompts the user typed while idle are judged; extension messages and
 		// steering/follow-ups queued during a run keep the current level.
 		judgeNextPrompt = event.source !== "extension" && event.streamingBehavior === undefined;
+		if (event.streamingBehavior === undefined) nextPromptFromExtension = event.source === "extension";
 		return undefined;
 	});
 
@@ -270,6 +457,10 @@ export default function piModesExtension(pi: ExtensionAPI) {
 			}
 		}
 
+		// A prompt from an extension (e.g. an auto-resume after a rate limit) continues the
+		// current task, so its review still covers everything since the user's prompt.
+		review.onUserPrompt(event.prompt, nextPromptFromExtension);
+		nextPromptFromExtension = false;
 		gercep.onUserPrompt(event.prompt);
 		careful.onUserPrompt();
 		confirmedCalls.clear();
@@ -330,20 +521,49 @@ export default function piModesExtension(pi: ExtensionAPI) {
 		if (message.role === "assistant") lastAssistantText = textOf(message.content);
 	});
 
-	// One combined follow-up per run, so the two modes never compete for the boundary.
-	pi.on("agent_before_settle", (event) => {
-		if (event.outcome !== "completed") return undefined;
+	// One combined boundary per run, so the modes never compete for it. The review comes
+	// first; when it sends findings to fix, the QA/rollback follow-ups wait for the fix run.
+	pi.on("agent_before_settle", async (event, ctx) => {
+		if (event.outcome !== "completed") {
+			review.onRunInterrupted();
+			const record = review.takeInterruptedRecord();
+			return record ? { entries: [{ type: "custom", customType: REVIEW_TASK_ENTRY, data: record }] } : undefined;
+		}
+		type Entry = { type: "custom"; customType: string; data: unknown } | { type: "custom_message"; customType: string; content: string; display: boolean; details?: unknown };
+		const entries: Entry[] = [];
+
+		let outcome: ReviewOutcome = {};
+		if (!isSubagent && repo && !reviewRunning) {
+			reviewCtx = ctx;
+			reviewManual = false;
+			reviewRunning = true;
+			try {
+				outcome = await review.atSettle(autoReview, lastAssistantText);
+			} finally {
+				reviewRunning = false;
+			}
+		}
+		if (outcome.record) entries.push({ type: "custom", customType: REVIEW_TASK_ENTRY, data: outcome.record });
+		if (outcome.notice) ctx.ui.notify(outcome.notice.text, outcome.notice.level);
+		if (outcome.details) entries.push({ type: "custom_message", ...reportMessage(outcome.details) });
+		if (outcome.fix) {
+			entries.push({ type: "custom_message", customType: REVIEW_FIX_TYPE, content: outcome.fix, display: false });
+			return { entries, continue: true };
+		}
+
 		const prompts = [gercep.followUpFor(lastAssistantText), careful.followUpFor(lastAssistantText)].filter(
 			(prompt): prompt is string => prompt !== undefined,
 		);
-		if (prompts.length === 0) return undefined;
-		return {
-			entries: [{ type: "custom_message", customType: FOLLOW_UP_TYPE, content: prompts.join("\n\n"), display: false }],
-			continue: true,
-		};
+		if (prompts.length > 0) {
+			entries.push({ type: "custom_message", customType: FOLLOW_UP_TYPE, content: prompts.join("\n\n"), display: false });
+			return { entries, continue: true };
+		}
+		return entries.length > 0 ? { entries } : undefined;
 	});
 
 	pi.on("session_shutdown", () => {
+		reviewLoader?.stop();
+		reviewLoader = undefined;
 		flashEditor?.dispose();
 		flashEditor = undefined;
 		delete process.env[ENV_FLAG];
@@ -530,6 +750,146 @@ export default function piModesExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	/** /review: review now, while the agent is idle; findings to fix start a new run. */
+	const manualReview = async (scope: ReviewScope, ctx: ExtensionContext) => {
+		if (isSubagent) {
+			ctx.ui.notify("/review does not run in subagents.", "warning");
+			return;
+		}
+		if (!ctx.isIdle()) {
+			ctx.ui.notify("🔍 The agent is still working. Run /review when it is done.", "info");
+			return;
+		}
+		if (reviewRunning) {
+			ctx.ui.notify("🔍 A review is already running.", "info");
+			return;
+		}
+		repo ??= repoRoot(ctx.cwd ?? sessionCwd);
+		if (!repo) {
+			ctx.ui.notify("🔍 /review needs a git repository.", "warning");
+			return;
+		}
+		reviewCtx = ctx;
+		reviewManual = true;
+		reviewRunning = true;
+		let outcome: ReviewOutcome;
+		try {
+			outcome = await review.manual(scope, lastAssistantText ?? lastAssistantOnBranch(ctx));
+		} finally {
+			reviewRunning = false;
+			reviewManual = false;
+		}
+		if (outcome.notice) ctx.ui.notify(outcome.notice.text, outcome.notice.level);
+		if (outcome.details) pi.sendMessage(reportMessage(outcome.details));
+		if (outcome.fix) {
+			// The fix run is a continuation of this review, not a new task.
+			nextPromptFromExtension = true;
+			pi.sendMessage({ customType: REVIEW_FIX_TYPE, content: outcome.fix, display: false }, { triggerTurn: true });
+		}
+	};
+
+	pi.registerCommand("review", {
+		description: "Review changes now with an independent reviewer model (task | session | uncommitted)",
+		getArgumentCompletions: (prefix) => {
+			const options = [
+				{ value: "task", label: "task — the last task that changed files (default)" },
+				{ value: "session", label: "session — every change the agent made in this session" },
+				{ value: "uncommitted", label: "uncommitted — all uncommitted changes (git diff HEAD + new files)" },
+			];
+			const filtered = options.filter((option) => option.value.startsWith(prefix));
+			return filtered.length > 0 ? filtered : null;
+		},
+		handler: async (args, ctx) => {
+			const scope = (args.trim().toLowerCase() || "task") as ReviewScope;
+			if (!REVIEW_SCOPES.includes(scope)) {
+				ctx.ui.notify(`Unknown argument "${args.trim()}". Use /review, /review session, or /review uncommitted.`, "warning");
+				return;
+			}
+			await manualReview(scope, ctx);
+		},
+	});
+
+	pi.registerCommand(REVIEW_MODE_ID, {
+		description: "Auto-review: an independent reviewer model checks each task's diff (on | off | status | model <provider/id>)",
+		getArgumentCompletions: (prefix) => {
+			const options = [
+				{ value: "on", label: "on — review every task that changes more than 20 lines or a risky path" },
+				{ value: "off", label: "off — stop automatic reviews (/review still works)" },
+				{ value: "status", label: "status — show the active modes and the reviewer model" },
+				{ value: "model ", label: `model <provider/id> — reviewer model (default ${DEFAULT_REVIEW_MODEL})` },
+			];
+			const filtered = options.filter((option) => option.value.startsWith(prefix));
+			return filtered.length > 0 ? filtered : null;
+		},
+		handler: async (args, ctx) => {
+			const [first = "", ...rest] = args.trim().split(/\s+/);
+			const action = first.toLowerCase() || "on";
+
+			if (action === "status") {
+				ctx.ui.notify(statusLine(), "info");
+				return;
+			}
+
+			if (action === "model") {
+				const ref = rest.join(" ").trim();
+				if (!ref) {
+					ctx.ui.notify(`Reviewer model: ${reviewModelRef(reviewConfig())}. Change it with /auto-review model <provider/id>.`, "info");
+					return;
+				}
+				const parts = splitModelRef(ref);
+				if (!parts || !ctx.modelRegistry.find(parts.provider, parts.id)) {
+					ctx.ui.notify(`Model "${ref}" not found. Use provider/id, e.g. ${DEFAULT_REVIEW_MODEL}.`, "warning");
+					return;
+				}
+				try {
+					writeReviewModel(ref);
+				} catch (error) {
+					ctx.ui.notify(`Could not save the reviewer model: ${error instanceof Error ? error.message : String(error)}`, "error");
+					return;
+				}
+				ctx.ui.notify(`🔍 Reviewer model set to ${ref} for every session.`, "info");
+				return;
+			}
+
+			if (action === "on") {
+				if (isSubagent) {
+					ctx.ui.notify("Auto-review does not run in subagents.", "warning");
+					return;
+				}
+				if (autoReview) {
+					ctx.ui.notify("Auto-review is already on for this session.", "info");
+					return;
+				}
+				repo ??= repoRoot(ctx.cwd ?? sessionCwd);
+				autoReview = true;
+				reviewUsed = true;
+				persist();
+				applyIndicators(ctx);
+				ctx.ui.notify(
+					`🔍 Auto-review on: ${reviewModelRef(reviewConfig())} reviews each task that changes more than 20 lines or a risky path; critical/major findings go back to the agent, then one re-review. /auto-review off to stop.${
+						repo ? "" : " (This folder is not a git repository, so nothing will be reviewed here.)"
+					}`,
+					repo ? "info" : "warning",
+				);
+				return;
+			}
+
+			if (action === "off") {
+				if (!autoReview) {
+					ctx.ui.notify("Auto-review is already off.", "info");
+					return;
+				}
+				autoReview = false;
+				persist();
+				applyIndicators(ctx);
+				ctx.ui.notify("Auto-review off. /review still reviews on demand.", "info");
+				return;
+			}
+
+			ctx.ui.notify(`Unknown argument "${action}". Use /auto-review on | off | status | model <provider/id>.`, "warning");
+		},
+	});
+
 	function statusLine(): string {
 		const last = effort.getLastDecision();
 		const active = [
@@ -538,9 +898,10 @@ export default function piModesExtension(pi: ExtensionAPI) {
 			effort.isActive()
 				? `auto-effort (judge ${judgeModelRef(readConfig())}${last ? `, last: ${last.level}${last.reason ? ` — ${last.reason}` : ""}` : ""})`
 				: undefined,
+			autoReview ? `auto-review (reviewer ${reviewModelRef(reviewConfig())}${repo ? "" : ", not a git repository"})` : undefined,
 		].filter((part): part is string => part !== undefined);
 		return active.length > 0
 			? `Active modes: ${active.join(" + ")}.`
-			: "Mode: default — pi behaves exactly as without this package. /gercep, /hati-hati, or /auto-effort to switch.";
+			: "Mode: default — pi behaves exactly as without this package. /gercep, /hati-hati, /auto-effort, or /auto-review to switch.";
 	}
 }
