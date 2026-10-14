@@ -40,15 +40,32 @@ import {
 } from "../src/effort.ts";
 import { ENV_FLAG, MODE_ID, QA_HEADING, STATUS_TEXT, categoryLabel } from "../src/gercep.ts";
 import { GercepEditor } from "../src/gercep-editor.ts";
-import { diffNumstat, diffPatch, headTree, repoRoot, snapshotTree } from "../src/git-snapshot.ts";
+import {
+	MAX_SCAN_REPOS,
+	dirtyRepos,
+	diffNumstat,
+	diffPatch,
+	findReposUnder,
+	headTree,
+	repoForPath,
+	repoRoot,
+	scanRoot,
+	snapshotTree,
+} from "../src/git-snapshot.ts";
 import {
 	DEFAULT_REVIEW_MODEL,
 	REVIEW_MODE_ID,
 	REVIEW_TIMEOUT_MS,
+	type DiffStats,
 	type ReportDetails,
 	type ReviewEffort,
 	type ReviewScope,
+	commandDirs,
+	commonAncestor,
+	labelNumstat,
+	mergeStats,
 	parseNumstat,
+	repoLabel,
 	reportExpanded,
 	reportText,
 	reviewConfig,
@@ -110,19 +127,27 @@ function restoredState(ctx: ExtensionContext): ModeState {
 	return state;
 }
 
+/** A snapshot map from storage: per repository, or the 0.5.0 form (one tree for the session's repository). */
+function readSnapshot(value: unknown, legacyRoot: string | undefined): Record<string, string> | undefined {
+	if (typeof value === "string") return legacyRoot ? { [legacyRoot]: value } : undefined;
+	if (!value || typeof value !== "object") return undefined;
+	const result: Record<string, string> = {};
+	for (const [root, tree] of Object.entries(value as Record<string, unknown>)) {
+		if (typeof tree === "string" && tree) result[root] = tree;
+	}
+	return Object.keys(result).length > 0 ? result : undefined;
+}
+
 /** The latest task with a change on the active branch, so /review works after /reload or /resume. */
-function restoredReviewTask(ctx: ExtensionContext): TaskRecord | undefined {
+function restoredReviewTask(ctx: ExtensionContext, legacyRoot: string | undefined): TaskRecord | undefined {
 	let record: TaskRecord | undefined;
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type !== "custom" || entry.customType !== REVIEW_TASK_ENTRY) continue;
-		const data = entry.data as Partial<TaskRecord> | undefined;
-		if (typeof data?.base === "string") {
-			record = {
-				request: typeof data.request === "string" ? data.request : "",
-				base: data.base,
-				...(typeof data.sessionBase === "string" ? { sessionBase: data.sessionBase } : {}),
-			};
-		}
+		const data = entry.data as { request?: unknown; base?: unknown; sessionBase?: unknown } | undefined;
+		const base = readSnapshot(data?.base, legacyRoot);
+		if (!base) continue;
+		const sessionBase = readSnapshot(data?.sessionBase, legacyRoot);
+		record = { request: typeof data?.request === "string" ? data.request : "", base, ...(sessionBase ? { sessionBase } : {}) };
 	}
 	return record;
 }
@@ -185,8 +210,12 @@ export default function piModesExtension(pi: ExtensionAPI) {
 	// ---- auto-review ----
 	let autoReview = false;
 	let reviewUsed = false;
-	/** Repository root of the session, or undefined outside git. */
+	/** The repository the session runs in, when it runs inside one. A monorepo folder has none. */
 	let repo: string | undefined;
+	/** Repositories found for tool calls this task, so each path is resolved once. */
+	let repoCache = new Map<string, string | null>();
+	/** Repositories the session has touched, in order; the folder they share is the reviewer's working folder. */
+	const touchedThisSession = new Set<string>();
 	/** Set by the input event: the next prompt came from an extension (e.g. an auto-resume), not the user. */
 	let nextPromptFromExtension = false;
 	/** The context the running review belongs to; set just before a review starts. */
@@ -198,19 +227,60 @@ export default function piModesExtension(pi: ExtensionAPI) {
 	let reviewLoader: Loader | undefined;
 
 	const reviewHost: ReviewHost = {
-		snapshot: () => (repo && !isSubagent ? snapshotTree(repo) : undefined),
-		headTree: () => (repo ? headTree(repo) : undefined),
+		snapshot: (roots) => {
+			const result: Record<string, string> = {};
+			for (const root of roots) {
+				const tree = snapshotTree(root);
+				if (tree !== undefined) result[root] = tree;
+			}
+			return result;
+		},
+		headTrees: (roots) => Object.fromEntries(roots.map((root) => [root, headTree(root)])),
+		scanDirty: async () => {
+			const top = scanRoot(sessionCwd);
+			if (!top) return { dirty: [], found: 0 };
+			const { repos, skipped } = findReposUnder(top);
+			if (skipped > 0) reviewCtx?.ui.notify(`🔍 Found more than ${MAX_SCAN_REPOS} repositories under ${top}; only the first ${MAX_SCAN_REPOS} were checked.`, "warning");
+			const own = repoRoot(sessionCwd);
+			const all = own && !repos.includes(own) ? [own, ...repos] : repos;
+			return { dirty: await dirtyRepos(all), found: all.length };
+		},
 		diff: (from, to) => {
-			if (!repo) return undefined;
+			const roots = Object.keys(from).filter((root) => to[root] !== undefined);
+			if (roots.length === 0) return undefined;
+			const workdir = roots.length === 1 ? roots[0]! : commonAncestor(roots);
+			const patterns = riskyPatterns(reviewConfig());
+			const stats: DiffStats[] = [];
+			const patches: string[] = [];
 			try {
-				const patterns = riskyPatterns(reviewConfig());
-				return { stats: parseNumstat(diffNumstat(repo, from, to), patterns), patch: diffPatch(repo, from, to) };
+				for (const root of roots) {
+					const label = repoLabel(workdir, root);
+					const numstat = labelNumstat(diffNumstat(root, from[root]!, to[root]!), label);
+					const parsed = parseNumstat(numstat, patterns);
+					if (parsed.files.length === 0) continue;
+					stats.push(parsed);
+					patches.push(diffPatch(root, from[root]!, to[root]!, label));
+				}
 			} catch {
 				return undefined;
 			}
+			const changed = roots.filter((root) => {
+				const label = repoLabel(workdir, root);
+				return stats.some((item) => item.files.some((file) => (label ? file.path.startsWith(`${label}/`) : true)));
+			});
+			return { stats: mergeStats(stats), patch: patches.join("\n"), repos: changed.map((root) => repoLabel(workdir, root) || "."), workdir };
 		},
 		modelRef: () => reviewModelRef(reviewConfig()),
-		runReviewer: (userText, effort) => runReviewerFor(userText, effort),
+		runReviewer: (userText, effort, workdir) => runReviewerFor(userText, effort, workdir),
+		confirm: async (question) => {
+			const ctx = reviewCtx;
+			if (!ctx?.hasUI) return false;
+			try {
+				return await ctx.ui.confirm("Review many repositories?", question);
+			} catch {
+				return false;
+			}
+		},
 	};
 	const review = new ReviewController(reviewHost);
 
@@ -242,11 +312,11 @@ export default function piModesExtension(pi: ExtensionAPI) {
 	};
 
 	/** Run the reviewer agent for the current reviewCtx. Never rejects. */
-	async function runReviewerFor(userText: string, effort: ReviewEffort): Promise<ReviewerRun> {
+	async function runReviewerFor(userText: string, effort: ReviewEffort, workdir: string): Promise<ReviewerRun> {
 		const ctx = reviewCtx;
 		const ref = reviewModelRef(reviewConfig());
 		const failed = (error: string): ReviewerRun => ({ text: "", ok: false, error, costUsd: 0, durationMs: 0 });
-		if (!ctx || !repo) return failed("no session context");
+		if (!ctx) return failed("no session context");
 		const parts = splitModelRef(ref);
 		const model = parts ? ctx.modelRegistry.find(parts.provider, parts.id) : undefined;
 		if (!model) return failed(`model ${ref} not found — set one with /auto-review model <provider/id>`);
@@ -269,7 +339,7 @@ export default function piModesExtension(pi: ExtensionAPI) {
 			const result = await runReviewer({
 				model,
 				effort,
-				cwd: repo,
+				cwd: workdir,
 				userText,
 				access: ctx.modelRegistry as never,
 				signal: abort.signal,
@@ -406,7 +476,9 @@ export default function piModesExtension(pi: ExtensionAPI) {
 		autoReview = !isSubagent && restored.autoReview === true;
 		reviewUsed = restored.autoReview !== undefined;
 		repo = isSubagent ? undefined : repoRoot(sessionCwd);
-		review.restore(restoredReviewTask(ctx));
+		repoCache = new Map();
+		touchedThisSession.clear();
+		review.restore(restoredReviewTask(ctx, repo));
 		nextPromptFromExtension = false;
 		knownModel = modelKey(ctx.model);
 		judgeNextPrompt = false;
@@ -459,7 +531,10 @@ export default function piModesExtension(pi: ExtensionAPI) {
 
 		// A prompt from an extension (e.g. an auto-resume after a rate limit) continues the
 		// current task, so its review still covers everything since the user's prompt.
-		review.onUserPrompt(event.prompt, nextPromptFromExtension);
+		if (!isSubagent) {
+			repoCache = new Map();
+			review.onUserPrompt(event.prompt, nextPromptFromExtension, repo ? [repo] : []);
+		}
 		nextPromptFromExtension = false;
 		gercep.onUserPrompt(event.prompt);
 		careful.onUserPrompt();
@@ -477,6 +552,15 @@ export default function piModesExtension(pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event, ctx) => {
 		const input = event.input as Record<string, unknown>;
+
+		// Save each repository's state before the first change to it, so a monorepo folder
+		// without git still gets a precise per-repository diff.
+		if (!isSubagent) {
+			for (const root of reposTouchedBy(event.toolName, input, ctx.cwd ?? sessionCwd)) {
+				touchedThisSession.add(root);
+				review.touch(root);
+			}
+		}
 
 		const decision = gercep.checkToolCall({ toolName: event.toolName, input });
 		if (decision.block) {
@@ -533,7 +617,7 @@ export default function piModesExtension(pi: ExtensionAPI) {
 		const entries: Entry[] = [];
 
 		let outcome: ReviewOutcome = {};
-		if (!isSubagent && repo && !reviewRunning) {
+		if (!isSubagent && !reviewRunning) {
 			reviewCtx = ctx;
 			reviewManual = false;
 			reviewRunning = true;
@@ -750,6 +834,25 @@ export default function piModesExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	/** Repositories a tool call may change: the file's repository, or those a bash command moves into. */
+	function reposTouchedBy(toolName: string, input: Record<string, unknown>, cwd: string): string[] {
+		const found = new Set<string>();
+		const add = (path: string | undefined) => {
+			if (!path) return;
+			const root = repoForPath(path, repoCache);
+			if (root) found.add(root);
+		};
+		if (toolName === "write" || toolName === "edit") {
+			const path = typeof input.path === "string" ? input.path : undefined;
+			if (path) add(path.startsWith("/") ? path : `${cwd.replace(/\/$/, "")}/${path}`);
+		} else if (toolName === "bash") {
+			const command = typeof input.command === "string" ? input.command : "";
+			for (const dir of commandDirs(command, cwd)) add(`${dir}/.`);
+			add(`${cwd}/.`);
+		}
+		return [...found];
+	}
+
 	/** /review: review now, while the agent is idle; findings to fix start a new run. */
 	const manualReview = async (scope: ReviewScope, ctx: ExtensionContext) => {
 		if (isSubagent) {
@@ -765,10 +868,6 @@ export default function piModesExtension(pi: ExtensionAPI) {
 			return;
 		}
 		repo ??= repoRoot(ctx.cwd ?? sessionCwd);
-		if (!repo) {
-			ctx.ui.notify("🔍 /review needs a git repository.", "warning");
-			return;
-		}
 		reviewCtx = ctx;
 		reviewManual = true;
 		reviewRunning = true;
@@ -861,15 +960,20 @@ export default function piModesExtension(pi: ExtensionAPI) {
 					return;
 				}
 				repo ??= repoRoot(ctx.cwd ?? sessionCwd);
+				const monorepo = !repo && scanRoot(ctx.cwd ?? sessionCwd) !== undefined;
 				autoReview = true;
 				reviewUsed = true;
 				persist();
 				applyIndicators(ctx);
 				ctx.ui.notify(
 					`🔍 Auto-review on: ${reviewModelRef(reviewConfig())} reviews each task that changes more than 20 lines or a risky path; critical/major findings go back to the agent, then one re-review. /auto-review off to stop.${
-						repo ? "" : " (This folder is not a git repository, so nothing will be reviewed here.)"
+						repo
+							? ""
+							: monorepo
+								? " (This folder is not a git repository itself: repositories inside it are reviewed as the agent changes them.)"
+								: " (This folder is not a git repository and has none inside it, so nothing will be reviewed here.)"
 					}`,
-					repo ? "info" : "warning",
+					repo || monorepo ? "info" : "warning",
 				);
 				return;
 			}
@@ -898,7 +1002,7 @@ export default function piModesExtension(pi: ExtensionAPI) {
 			effort.isActive()
 				? `auto-effort (judge ${judgeModelRef(readConfig())}${last ? `, last: ${last.level}${last.reason ? ` — ${last.reason}` : ""}` : ""})`
 				: undefined,
-			autoReview ? `auto-review (reviewer ${reviewModelRef(reviewConfig())}${repo ? "" : ", not a git repository"})` : undefined,
+			autoReview ? `auto-review (reviewer ${reviewModelRef(reviewConfig())}${repo ? "" : ", monorepo folder"})` : undefined,
 		].filter((part): part is string => part !== undefined);
 		return active.length > 0
 			? `Active modes: ${active.join(" + ")}.`

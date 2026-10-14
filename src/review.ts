@@ -8,7 +8,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, relative, sep } from "node:path";
 import { configPath, readConfig } from "./effort.ts";
 
 export const REVIEW_MODE_ID = "auto-review";
@@ -20,6 +20,9 @@ export const LARGE_FILES = 10;
 export const LARGE_LINES = 400;
 /** Reviews per task: the first review plus one re-review of the fix. */
 export const MAX_ROUNDS = 2;
+/** /review uncommitted asks first when it would review more repositories than this, or more lines. */
+export const CONFIRM_REPOS = 3;
+export const CONFIRM_LINES = 3000;
 /** The patch sent to the reviewer is cut here; it can still read the files. */
 export const MAX_PATCH_CHARS = 120_000;
 export const REVIEW_TIMEOUT_MS = 15 * 60_000;
@@ -67,6 +70,78 @@ export interface DiffStats {
 	files: FileStat[];
 	lines: number;
 	riskyFiles: string[];
+}
+
+// ---- several repositories ----------------------------------------------------------
+
+/** Working-tree snapshots, one git tree per repository root. */
+export type Snapshot = Record<string, string>;
+
+/** The folder that contains every given path (a single path is its own folder). */
+export function commonAncestor(paths: readonly string[]): string {
+	if (paths.length === 0) return sep;
+	const split = paths.map((path) => path.split(sep));
+	const first = split[0] ?? [];
+	let length = first.length;
+	for (const parts of split) {
+		let index = 0;
+		while (index < length && index < parts.length && parts[index] === first[index]) index++;
+		length = index;
+	}
+	return first.slice(0, length).join(sep) || sep;
+}
+
+/** A repository's folder relative to the shared one, "" when it is that folder. */
+export function repoLabel(workdir: string, root: string): string {
+	return relative(workdir, root).split(sep).join("/");
+}
+
+/** Put every path of a `git diff --numstat` output under a folder name. */
+export function labelNumstat(output: string, label: string): string {
+	if (!label) return output;
+	return output
+		.split("\n")
+		.map((line) => {
+			const parts = line.split("\t");
+			return parts.length < 3 ? line : `${parts[0]}\t${parts[1]}\t${label}/${parts.slice(2).join("\t")}`;
+		})
+		.join("\n");
+}
+
+/**
+ * Directories a shell command works in: `cd <dir>`, `git -C <dir>`, `pushd <dir>`.
+ * Only plain words are understood (no variables or substitutions), which covers the
+ * usual `cd frnd-web && ...`. Anything else is ignored, never guessed.
+ */
+export function commandDirs(command: string, cwd: string): string[] {
+	const dirs: string[] = [];
+	for (const match of command.matchAll(/(?:^|[;&|(])\s*(?:cd|pushd|git\s+-C)\s+(?:"([^"$`]+)"|'([^']+)'|([^\s;&|)$`"']+))/g)) {
+		const raw = match[1] ?? match[2] ?? match[3];
+		if (!raw) continue;
+		const expanded = raw === "~" || raw.startsWith("~/") ? (process.env.HOME ?? "") + raw.slice(1) : raw;
+		dirs.push(expanded.startsWith("/") ? expanded : `${cwd.replace(/\/$/, "")}/${expanded}`);
+	}
+	return dirs;
+}
+
+/** The question shown before a large /review uncommitted. */
+export function largeReviewQuestion(repos: readonly string[], files: number, lines: number): string {
+	const shown = repos.slice(0, 8).join(", ");
+	const more = repos.length > 8 ? ` and ${repos.length - 8} more` : "";
+	return [
+		`/review uncommitted would send ${files} files (${lines} lines) from ${repos.length} repositories to the reviewer:`,
+		`${shown}${more}`,
+		"",
+		"A folder of unrelated projects is not one change. Review them together anyway? The diff is cut at 120k characters.",
+	].join("\n");
+}
+
+export function mergeStats(list: readonly DiffStats[]): DiffStats {
+	return {
+		files: list.flatMap((stats) => stats.files),
+		lines: list.reduce((sum, stats) => sum + stats.lines, 0),
+		riskyFiles: list.flatMap((stats) => stats.riskyFiles),
+	};
 }
 
 // ---- config (~/.pi/agent/pi-modes.json, key "autoReview") -------------------------
@@ -180,6 +255,8 @@ export interface ReviewInput {
 	patch: string;
 	/** Findings from the previous round, for a re-review of the fix. */
 	previous?: Finding[];
+	/** Repository folders (relative to the review's working folder) when the change spans several. */
+	repos?: string[];
 }
 
 export function truncatePatch(patch: string, limit = MAX_PATCH_CHARS): { patch: string; truncated: boolean } {
@@ -215,6 +292,13 @@ export function reviewerUserText(input: ReviewInput): string {
 		parts.push("", "## Findings being fixed", formatFindingsForPrompt(input.previous));
 	}
 	if (input.agentSummary) parts.push("", "## The agent's own summary (may be wrong)", clip(input.agentSummary, 3000));
+	if (input.repos && input.repos.length > 1) {
+		parts.push(
+			"",
+			`## Repositories`,
+			`The change spans ${input.repos.length} separate git repositories: ${input.repos.join(", ")}. Every path below starts with its repository folder and is relative to your working folder, which contains all of them. Check whether a change in one repository breaks code that depends on it in another.`,
+		);
+	}
 	parts.push("", `## Changed files (${input.stats.files.length}, ${input.stats.lines} lines)`, files || "(none)");
 	parts.push("", "## Diff", "```diff", patch, "```");
 	if (truncated) parts.push("", "The diff was truncated. Read the remaining files with the read tool.");
@@ -312,6 +396,8 @@ export interface ReportDetails {
 	effortReason: string;
 	files: number;
 	lines: number;
+	/** Repository folders, when the review spanned more than one. */
+	repos?: string[];
 	findings: Finding[];
 	checked: string[];
 	action: ReportAction;
@@ -381,6 +467,7 @@ export function reportExpanded(details: ReportDetails): string {
 	lines.push(
 		`Scope: ${details.scope}${details.round > 1 ? " (fix diff)" : ""} · ${details.files} files, ${details.lines} lines · effort ${details.effort} (${details.effortReason})`,
 	);
+	if (details.repos && details.repos.length > 1) lines.push(`Repositories (${details.repos.length}): ${details.repos.join(", ")}`);
 	const meta = [
 		details.durationMs !== undefined ? `${Math.round(details.durationMs / 1000)}s` : undefined,
 		details.costUsd !== undefined && details.costUsd > 0 ? `$${details.costUsd.toFixed(2)}` : undefined,
