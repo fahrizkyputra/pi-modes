@@ -28,7 +28,7 @@ pi install npm:@fahrizkyputra/pi-modes
 | `/auto-review` or `/auto-review on` · `/auto-review off` | Turn automatic review on or off for this session |
 | `/auto-review model <provider/id>` | Set the reviewer model for every session (default `9router/cc/claude-opus-5-5`) |
 | `/review` | Review the last task that changed files, now — also when auto-review is off |
-| `/review session` · `/review uncommitted` | Review every change of this session, or everything not committed yet (including your own edits) |
+| `/review session` · `/review uncommitted` | Review every change of this session, or everything not committed yet (including your own edits), across all repositories of a monorepo folder |
 | `/gercep status` · `/hati-hati status` · `/auto-effort status` · `/auto-review status` | Show the active modes |
 
 The status bar shows the active modes, e.g. `⚡ gercep · 🛡 hati-hati`, and so does the line shown while the agent is working: `Working ⚡ gercep`, `Working ⚡ gercep · 🛡 hati-hati`. With every mode off it is Pi's own `Working` again.
@@ -168,9 +168,19 @@ When a task ends (the agent settles after a prompt you sent), pi-modes looks at 
 | The agent changed nothing for the findings | No re-review |
 | A rate-limited run resumed by an extension (e.g. pi-auto-resume) | Same task: the review covers everything since your prompt |
 | With gercep | Review runs normally; the QA checklist follow-up comes after the fix and re-review |
-| Not a git repository | Nothing is reviewed; `/review` says so |
+| No git repository anywhere (here or inside) | Nothing is reviewed; `/review` says so |
 
-**How changes are found.** At each prompt, pi-modes snapshots the working tree as a git tree object using a temporary index file (`git add -A` + `git write-tree` against a copy of the index). Your working tree, index, staged files, stash, branches, and commits are never touched, and ignored files stay out. The snapshot objects are unreachable, so `git gc` removes them eventually. This runs in every git session, also with auto-review off, so `/review` works when you forgot to turn it on; it takes a few milliseconds.
+### Monorepo folders
+
+`/review` and `/auto-review` also work when the folder you run Pi in is **not a git repository but holds several** (`acme/` with `web`, `api`, `worker`, …), and when you run Pi inside one of them while the agent changes its siblings.
+
+- **No fixed repository.** Each repository is saved the first time a tool call touches it, **before** the change: the repository of the file a `write`/`edit` targets (even a new file in a new folder), and the folders a `bash` command moves into with `cd <dir>`, `pushd`, or `git -C <dir>`. Repositories the task never touched are never snapshotted, so a folder with 30 repositories costs nothing extra per prompt.
+- **One review across all of them.** The diffs are merged into a single report. Every path starts with its repository folder (`api/src/orders.ts`), and the reviewer is told that the change spans several repositories, so it can check that a change in one does not break code that depends on it in another. The reviewer's working folder is the folder that contains them all, so it can read files in any of them.
+- **Fix and re-review.** Findings go back to the agent as usual. The re-review covers only what the fix changed, including a repository the fix touched for the first time.
+- **`/review uncommitted`** scans from the nearest parent folder without git (never your home folder), at most 5 levels deep, skipping `node_modules`, and includes git worktrees (`.worktrees/*`). Only repositories with uncommitted changes are reviewed. If that is more than 3 repositories or more than 3000 lines, Pi asks first — a folder of unrelated projects is not one change. Without a UI it does not run. The scan checks at most 40 repositories and says so when it stops early.
+- **What it cannot see.** A repository the agent changes only through a command that does not name its folder (a script that writes elsewhere, a variable like `cd $PROJECT`) is not found; `/review uncommitted` still catches it.
+
+**How changes are found.** Before the first change to a repository, pi-modes snapshots its working tree as a git tree object using a temporary index file (`git add -A` + `git write-tree` against a copy of the index). Your working tree, index, staged files, stash, branches, and commits are never touched, and ignored files stay out. The snapshot objects are unreachable, so `git gc` removes them eventually. This runs in every session, also with auto-review off, so `/review` works when you forgot to turn it on; one snapshot takes about 0.1 s.
 
 **Cost.** One review is one reviewer agent run: roughly 20k input / 5k output tokens for a small change, more for big ones. With Opus 5.5 that is about $0.20–1.30 per review, plus the re-review when findings were sent to fix.
 

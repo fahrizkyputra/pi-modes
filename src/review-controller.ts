@@ -1,22 +1,27 @@
 /**
  * The review state machine for one session, independent of Pi and git.
  *
- * A task starts when the user sends a prompt: the working tree is snapshotted.
- * When the run ends, the change since that snapshot is reviewed (automatically
- * when auto-review is on and the change is big or risky, or later with /review).
- * Critical/major findings go back to the agent; when that fix run ends, only the
- * fix diff is re-reviewed, once. Then the task is done.
+ * A task starts when the user sends a prompt. Every repository the task touches
+ * is snapshotted before its first change (a monorepo folder may hold many
+ * repositories, and only the touched ones matter). When the run ends, the change
+ * since those snapshots is reviewed (automatically when auto-review is on and the
+ * change is big or risky, or later with /review). Critical/major findings go back
+ * to the agent; when that fix run ends, only the fix diff is re-reviewed, once.
  */
 
 import {
 	type DiffStats,
 	type Finding,
+	type Snapshot,
 	MAX_ROUNDS,
 	type ReportDetails,
 	type ReviewEffort,
 	type ReviewScope,
+	CONFIRM_LINES,
+	CONFIRM_REPOS,
 	blockingFindings,
 	decideAction,
+	largeReviewQuestion,
 	fixPrompt,
 	parseReviewerReply,
 	pickEffort,
@@ -34,21 +39,32 @@ export interface ReviewerRun {
 }
 
 export interface ReviewHost {
-	/** Tree of the working tree now, or undefined outside git / on failure. */
-	snapshot(): string | undefined;
-	/** Tree of HEAD (the empty tree without commits). */
-	headTree(): string | undefined;
-	diff(from: string, to: string): { stats: DiffStats; patch: string } | undefined;
+	/** The current working tree of each given repository (those that cannot be read are left out). */
+	snapshot(roots: readonly string[]): Snapshot;
+	/** Repositories with uncommitted changes under the monorepo folder (or the repository itself). */
+	scanDirty(): Promise<{ dirty: string[]; found: number }>;
+	/** HEAD tree of each repository (the empty tree before the first commit). */
+	headTrees(roots: readonly string[]): Snapshot;
+	/**
+	 * Diff of every repository present in both snapshots, merged into one patch whose paths
+	 * start with the repository folder, relative to `workdir` (the folder that contains them
+	 * all). Undefined when a snapshot is gone.
+	 */
+	diff(from: Snapshot, to: Snapshot): { stats: DiffStats; patch: string; repos: string[]; workdir: string } | undefined;
 	/** Model reference used for reviews, e.g. 9router/cc/claude-opus-5-5. */
 	modelRef(): string;
-	runReviewer(userText: string, effort: ReviewEffort): Promise<ReviewerRun>;
+	runReviewer(userText: string, effort: ReviewEffort, workdir: string): Promise<ReviewerRun>;
+	/** Ask the user before a large review; false means "no" (also when there is no way to ask). */
+	confirm(question: string): Promise<boolean>;
 }
 
 /** Persisted so /review still finds the last task after /reload or /resume. */
 export interface TaskRecord {
 	request: string;
-	base: string;
-	sessionBase?: string;
+	/** One git tree per repository root, taken before the task first touched that repository. */
+	base: Snapshot;
+	/** Same, taken before the session first touched each repository. */
+	sessionBase?: Snapshot;
 }
 
 type Phase = "idle" | "awaiting-fix" | "done";
@@ -66,18 +82,24 @@ export interface ReviewOutcome {
 	effort?: ReviewEffort;
 }
 
+const changedRoots = (from: Snapshot, to: Snapshot): string[] =>
+	Object.keys(from).filter((root) => to[root] !== undefined && to[root] !== from[root]);
+
 export class ReviewController {
 	private phase: Phase = "done";
 	private request = "";
-	private base: string | undefined;
-	private sessionBase: string | undefined;
+	/** Repositories this task touched, as they were before the task first touched them. */
+	private base: Snapshot = {};
+	private sessionBase: Snapshot = {};
 	private recorded = false;
-	/** For the re-review after a fix. */
-	private fixBase: string | undefined;
+	/** For the re-review after a fix: the state after the first review, plus repositories the fix touched. */
+	private fixBase: Snapshot = {};
 	private fixScope: ReviewScope = "task";
 	private previous: Finding[] = [];
 	/** The last task with a change, for /review. */
 	private lastTask: TaskRecord | undefined;
+	/** Set when a run was interrupted after changing files, so /review can still find the task. */
+	private pendingRecord = false;
 
 	private readonly host: ReviewHost;
 
@@ -88,9 +110,9 @@ export class ReviewController {
 	/** Restore /review's targets from persisted records. */
 	restore(record: TaskRecord | undefined): void {
 		this.lastTask = record;
-		this.sessionBase = record?.sessionBase ?? record?.base;
+		this.sessionBase = { ...(record?.sessionBase ?? record?.base ?? {}) };
 		this.phase = "done";
-		this.base = undefined;
+		this.base = {};
 	}
 
 	getLastTask(): TaskRecord | undefined {
@@ -102,20 +124,35 @@ export class ReviewController {
 	}
 
 	/**
-	 * A prompt starts a run. From the user: a new task begins at the current working
-	 * tree. From an extension (e.g. an auto-resume after a rate limit) while a task is
-	 * still open: the same task continues, keeping its starting point.
+	 * A prompt starts a run. From the user: a new task begins, with `startRoots` (the
+	 * repository the session runs in) snapshotted now. From an extension (e.g. an
+	 * auto-resume after a rate limit) while a task is still open: the same task continues.
 	 */
-	onUserPrompt(prompt: string, fromExtension = false): void {
-		if (fromExtension && this.phase === "idle" && this.base !== undefined) return;
+	onUserPrompt(prompt: string, fromExtension = false, startRoots: readonly string[] = []): void {
+		if (fromExtension && this.phase === "idle") return;
 		if (fromExtension && this.phase === "awaiting-fix") return;
-		this.base = this.host.snapshot();
-		this.sessionBase ??= this.base;
+		this.base = {};
 		this.request = prompt;
 		this.phase = "idle";
 		this.recorded = false;
+		this.pendingRecord = false;
 		this.previous = [];
-		this.fixBase = undefined;
+		this.fixBase = {};
+		for (const root of startRoots) this.touch(root);
+	}
+
+	/**
+	 * A tool is about to change something in this repository. Its state is saved the
+	 * first time, before the change, so the task's diff starts from here.
+	 */
+	touch(root: string): void {
+		if (this.phase === "done") return;
+		const target = this.phase === "awaiting-fix" ? this.fixBase : this.base;
+		if (root in target && root in this.sessionBase) return;
+		const snapshot = this.host.snapshot([root])[root];
+		if (snapshot === undefined) return;
+		if (!(root in target)) target[root] = snapshot;
+		if (!(root in this.sessionBase)) this.sessionBase[root] = snapshot;
 	}
 
 	/**
@@ -124,21 +161,18 @@ export class ReviewController {
 	 */
 	onRunInterrupted(): void {
 		if (this.phase === "awaiting-fix") this.phase = "done";
-		if (this.phase === "idle" && this.base !== undefined && !this.recorded) {
-			const end = this.host.snapshot();
-			if (end !== undefined && end !== this.base) this.pendingRecord = true;
+		if (this.phase === "idle" && !this.recorded) {
+			const roots = Object.keys(this.base);
+			if (changedRoots(this.base, this.host.snapshot(roots)).length > 0) this.pendingRecord = true;
 		}
 	}
 
-	/** A task changed files but its run was interrupted: record it for /review at the next settle. */
-	private pendingRecord = false;
-
 	/** Record an interrupted task with changes, so /review can still find it. */
 	takeInterruptedRecord(): TaskRecord | undefined {
-		if (!this.pendingRecord || this.recorded || this.base === undefined) return undefined;
+		if (!this.pendingRecord || this.recorded) return undefined;
 		this.pendingRecord = false;
 		this.recorded = true;
-		this.lastTask = { request: this.request, base: this.base, sessionBase: this.sessionBase };
+		this.lastTask = { request: this.request, base: { ...this.base }, sessionBase: { ...this.sessionBase } };
 		return this.lastTask;
 	}
 
@@ -147,17 +181,18 @@ export class ReviewController {
 	 * is on (first round) or a fix is waiting for its re-review.
 	 */
 	async atSettle(autoActive: boolean, agentSummary: string | undefined, onEffort?: (effort: ReviewEffort) => void): Promise<ReviewOutcome> {
-		if (this.phase === "awaiting-fix") {
-			return this.reReview(agentSummary, onEffort);
-		}
-		if (this.phase !== "idle" || this.base === undefined) return {};
+		if (this.phase === "awaiting-fix") return this.reReview(agentSummary, onEffort);
+		if (this.phase !== "idle") return {};
 
-		const end = this.host.snapshot();
-		if (end === undefined || end === this.base) return {};
+		const roots = Object.keys(this.base);
+		if (roots.length === 0) return {};
+		const end = this.host.snapshot(roots);
+		if (changedRoots(this.base, end).length === 0) return {};
+
 		const outcome: ReviewOutcome = {};
 		if (!this.recorded) {
 			this.recorded = true;
-			this.lastTask = { request: this.request, base: this.base, sessionBase: this.sessionBase };
+			this.lastTask = { request: this.request, base: { ...this.base }, sessionBase: { ...this.sessionBase } };
 			outcome.record = this.lastTask;
 		}
 		if (!autoActive) return outcome;
@@ -173,39 +208,53 @@ export class ReviewController {
 
 	/** /review [task|session|uncommitted], run while the agent is idle. */
 	async manual(scope: ReviewScope, agentSummary: string | undefined, onEffort?: (effort: ReviewEffort) => void): Promise<ReviewOutcome> {
-		const end = this.host.snapshot();
-		if (end === undefined) return { notice: { text: "🔍 /review needs a git repository.", level: "warning" } };
-
-		let from: string | undefined;
+		let from: Snapshot;
+		let roots: string[];
 		let request = "";
 		if (scope === "task") {
 			if (!this.lastTask) return { notice: { text: "🔍 No task with file changes in this session yet. Try /review uncommitted.", level: "info" } };
 			from = this.lastTask.base;
+			roots = Object.keys(from);
 			request = this.lastTask.request;
 		} else if (scope === "session") {
-			from = this.sessionBase ?? this.lastTask?.sessionBase ?? this.lastTask?.base;
-			if (!from) return { notice: { text: "🔍 Nothing changed in this session yet. Try /review uncommitted.", level: "info" } };
+			from = this.sessionBase;
+			if (Object.keys(from).length === 0) return { notice: { text: "🔍 Nothing changed in this session yet. Try /review uncommitted.", level: "info" } };
+			roots = Object.keys(from);
 			request = this.lastTask ? `All work in this session. Latest request: ${this.lastTask.request}` : "All work in this session.";
 		} else {
-			from = this.host.headTree();
-			request = "Review all uncommitted changes (working tree against HEAD).";
+			const scan = await this.host.scanDirty();
+			if (scan.found === 0) return { notice: { text: "🔍 /review uncommitted needs a git repository here or in a folder below.", level: "warning" } };
+			if (scan.dirty.length === 0) return { notice: { text: `🔍 No uncommitted changes in ${scan.found} repositor${scan.found === 1 ? "y" : "ies"}.`, level: "info" } };
+			roots = scan.dirty;
+			from = this.host.headTrees(roots);
+			request =
+				roots.length > 1
+					? `Review all uncommitted changes (working tree against HEAD) in ${roots.length} repositories.`
+					: "Review all uncommitted changes (working tree against HEAD).";
 		}
-		if (!from) return { notice: { text: "🔍 Could not read the repository state.", level: "warning" } };
 
+		const end = this.host.snapshot(roots);
+		if (Object.keys(end).length === 0) return { notice: { text: "🔍 Could not read the repository state.", level: "warning" } };
 		const diff = this.host.diff(from, end);
 		if (diff === undefined) {
 			return { notice: { text: "🔍 The saved snapshot is no longer available (git may have pruned it). Try /review uncommitted.", level: "warning" } };
 		}
 		if (diff.stats.files.length === 0) return { notice: { text: "🔍 No changes to review.", level: "info" } };
+		// A folder of unrelated projects is not one change: ask before sending that much.
+		if (scope === "uncommitted" && (diff.repos.length > CONFIRM_REPOS || diff.stats.lines > CONFIRM_LINES)) {
+			const approved = await this.host.confirm(largeReviewQuestion(diff.repos, diff.stats.files.length, diff.stats.lines));
+			if (!approved) return { notice: { text: "🔍 Review skipped. Run /review inside one repository, or /review task for what the agent changed.", level: "info" } };
+		}
 		this.request = request;
 		return this.review({ round: 1, scope, request, agentSummary, end, ...diff }, onEffort);
 	}
 
 	private async reReview(agentSummary: string | undefined, onEffort?: (effort: ReviewEffort) => void): Promise<ReviewOutcome> {
 		this.phase = "done";
-		const end = this.host.snapshot();
-		if (end === undefined || this.fixBase === undefined) return {};
-		if (end === this.fixBase) {
+		const roots = Object.keys(this.fixBase);
+		if (roots.length === 0) return {};
+		const end = this.host.snapshot(roots);
+		if (changedRoots(this.fixBase, end).length === 0) {
 			return { notice: { text: "🔍 The agent changed no files for the findings; no re-review.", level: "info" } };
 		}
 		const diff = this.host.diff(this.fixBase, end);
@@ -219,9 +268,11 @@ export class ReviewController {
 			scope: ReviewScope;
 			request: string;
 			agentSummary?: string;
-			end: string;
+			end: Snapshot;
 			stats: DiffStats;
 			patch: string;
+			repos: string[];
+			workdir: string;
 			previous?: Finding[];
 		},
 		onEffort?: (effort: ReviewEffort) => void,
@@ -229,7 +280,7 @@ export class ReviewController {
 		const { effort, reason } = pickEffort(input.stats);
 		onEffort?.(effort);
 		const model = this.host.modelRef();
-		const run = await this.host.runReviewer(reviewerUserText(input), effort);
+		const run = await this.host.runReviewer(reviewerUserText(input), effort, input.workdir);
 		if (!run.ok) {
 			this.phase = "done";
 			const cancelled = run.error === "cancelled";
@@ -252,6 +303,7 @@ export class ReviewController {
 			effortReason: reason,
 			files: input.stats.files.length,
 			lines: input.stats.lines,
+			...(input.repos.length > 1 ? { repos: input.repos } : {}),
 			findings: parsed?.findings ?? [],
 			checked: parsed?.checked ?? [],
 			action,
@@ -262,7 +314,7 @@ export class ReviewController {
 
 		if (action === "sent-to-fix" && input.round < MAX_ROUNDS) {
 			this.phase = "awaiting-fix";
-			this.fixBase = input.end;
+			this.fixBase = { ...input.end };
 			this.fixScope = input.scope;
 			this.previous = blockingFindings(details.findings);
 			return { details, effort, fix: fixPrompt(this.previous, shortModel(model)) };

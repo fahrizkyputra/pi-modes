@@ -1,7 +1,7 @@
 {
   "name": "@fahrizkyputra/pi-modes",
-  "version": "0.5.0",
-  "description": "Selectable, independent agent modes for Pi. /gercep: no tests/typecheck/lint/build, ends with a manual QA checklist. /hati-hati: confirm every risky command, ends with a rollback section. /auto-effort: a small judge model sets thinking per prompt. /auto-review and /review: an independent reviewer model checks each task's diff and sends critical/major findings back to fix. Default stays untouched.",
+  "version": "0.6.0",
+  "description": "Selectable, independent agent modes for Pi. /gercep: no tests/typecheck/lint/build, ends with a manual QA checklist. /hati-hati: confirm every risky command, ends with a rollback section. /auto-effort: a small judge model sets thinking per prompt. /auto-review and /review: an independent reviewer model checks each task's diff (across every repository of a monorepo folder) and sends critical/major findings back to fix. Default stays untouched.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -22,7 +22,9 @@
     "review",
     "code-review",
     "reviewer",
-    "auto-review"
+    "auto-review",
+    "monorepo",
+    "multi-repo"
   ],
   "license": "MIT",
   "author": "Fahrizky Putra",
@@ -49,7 +51,7 @@
   "scripts": {
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "test:e2e": "node scripts/e2e-gercep.mjs && node scripts/e2e-careful.mjs && node scripts/e2e-effort.mjs && node scripts/e2e-review.mjs"
+    "test:e2e": "node scripts/e2e-gercep.mjs && node scripts/e2e-careful.mjs && node scripts/e2e-effort.mjs && node scripts/e2e-review.mjs && node scripts/e2e-monorepo.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
