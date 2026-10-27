@@ -198,6 +198,29 @@ When a task ends (the agent settles after a prompt you sent), pi-modes looks at 
 - The review progress line and Esc-to-cancel are terminal-UI features; in RPC clients the review still runs and reports, with a status text instead.
 - Hati-hati recognizes risky commands by pattern. A wrapper script whose name does not mention deploy/release/publish/migrate (e.g. `./go.sh`) is not recognized; the prompt rule asks the agent to announce risky steps, but only recognized commands get a dialog.
 
+## jcode
+
+Gercep and hati-hati also work in [jcode](https://github.com/1jehuang/jcode), with the same rules and the same command and risk detection:
+
+```bash
+npx -y @fahrizkyputra/pi-modes jcode install     # needs Node 22.18+
+```
+
+Then, in a jcode session, `/gercep`, `/hati-hati` (and `… off`, `… status`). Reload skills first in a session that was already open (`skill_manage reload_all`).
+
+| | Pi | jcode |
+|---|---|---|
+| Turning a mode on | extension command | a skill: the agent runs `jcode-modes on <mode>`, which records the mode for this session and prints its rules into the conversation |
+| Blocking | `tool_call` handler | a `[hooks] pre_tool` gate in `~/.jcode/config.toml`; the block reason goes back to the agent |
+| "jalankan test" unlocks tests | yes | yes: the gate reads your latest message from the session file |
+| Hati-hati confirmation | a yes/no dialog | the command is held with a code; you type the `!` line it shows, e.g. `!jcode-modes approve 74d450`, then tell the agent to continue. The approval is for that exact command, once, within 10 minutes. The agent cannot approve itself or turn hati-hati off without the same approval |
+| QA checklist / rollback section | asked again if missing | prompt rule only (jcode has no hook that can send a follow-up) |
+| Auto-effort, auto-review | yes | not ported. jcode has its own `autoreview` and `autojudge` |
+
+The installer copies the code to `~/.jcode/plugins/pi-modes/`, links `/gercep` and `/hati-hati` into `~/.jcode/skills` (never over an existing folder), and links `jcode-modes` into `~/.local/bin` when that is on `PATH` and free. It edits only its own command in `[hooks]`; the first edit keeps `config.toml.pi-modes.bak`. With no mode on, the gate exits in the shell without starting Node. A broken gate fails open.
+
+Update: run the install line again. Remove: `jcode-modes uninstall` (held behind approval while hati-hati is on).
+
 ## Development
 
 ```bash

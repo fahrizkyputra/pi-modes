@@ -1,6 +1,6 @@
 {
   "name": "@fahrizkyputra/pi-modes",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Selectable, independent agent modes for Pi. /gercep: no tests/typecheck/lint/build, ends with a manual QA checklist. /hati-hati: confirm every risky command, ends with a rollback section. /auto-effort: a small judge model sets thinking per prompt. /auto-review and /review: an independent reviewer model checks each task's diff (across every repository of a monorepo folder) and sends critical/major findings back to fix. Default stays untouched.",
   "keywords": [
     "pi-package",
@@ -24,7 +24,8 @@
     "reviewer",
     "auto-review",
     "monorepo",
-    "multi-repo"
+    "multi-repo",
+    "jcode"
   ],
   "license": "MIT",
   "author": "Fahrizky Putra",
@@ -42,9 +43,14 @@
       "./extensions/pi-modes.ts"
     ]
   },
+  "bin": {
+    "pi-modes": "bin/jcode.mjs"
+  },
   "files": [
     "extensions",
+    "bin",
     "src",
+    "jcode",
     "README.md",
     "LICENSE"
   ],
